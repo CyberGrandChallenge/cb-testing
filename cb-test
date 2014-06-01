@@ -1,0 +1,213 @@
+#!/usr/bin/python
+
+"""
+CB Testing tool
+
+Copyright (C) 2014 - Brian Caswell <bmc@lungetech.com>
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+This tool allows verification of POV and POLLs with a CGC challenge binary
+using 'cb-replay', 'tcpdump', and 'cb-server'.
+"""
+
+import glob
+import argparse
+import logging
+import os
+import random
+import resource
+import subprocess
+import sys
+import thread
+import threading
+import time
+
+
+class Background(object):
+    def __init__(self, cmd):
+        logging.info('launching %s', ' '.join(cmd))
+        self.cmd = cmd[0]
+        self.process = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                        stderr=subprocess.PIPE)
+        self.threads = []
+        self.log(self.process.stdout)
+        self.log(self.process.stderr)
+
+    def log(self, filehandle):
+        def log_background(log):
+            try:
+                for line in iter(log.readline, ''):
+                    logging.warning('%s: %s', self.cmd, line[:-1])
+                log.close()
+            except KeyboardInterrupt:
+                thread.interrupt_main()
+
+        my_thread = threading.Thread(target=log_background,
+                                     args=(filehandle, ))
+        my_thread.daemon = True
+        my_thread.start()
+        self.threads.append(my_thread)
+
+    def terminate(self):
+        logging.debug('terminating %s', self.cmd)
+        self.process.terminate()
+        for my_thread in self.threads:
+            my_thread.join()
+
+
+class Runner(object):
+    def __init__(self, port, cb_list, xml_list, pcap, directory, should_core, log_fh):
+        self.port = port
+        self.cb_list = cb_list
+        self.xml_list = xml_list
+        self.pcap = pcap
+        self.directory = directory
+        self.should_core = should_core
+        self.processes = []
+        self.log_fh = log_fh
+
+        self.ip_address = self.random_ip()
+        if not isinstance(self.port, int):
+            self.port = self.random_port()
+
+        resource.setrlimit(resource.RLIMIT_CORE, (resource.RLIM_INFINITY,
+                           resource.RLIM_INFINITY))
+
+    def background(self, cmd):
+        process = Background(cmd)
+        self.processes.append(process)
+        if process.process.poll():
+            raise Exception('background process failed')
+
+    def launch(self, cmd):
+        logging.info('launching %s', ' '.join(cmd))
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE)
+        stdout, stderr = process.communicate()
+        if len(stderr):
+            for line in stderr.split('\n'):
+                logging.warning('%s (stderr): %s', cmd[0], line)
+        self.log_fh.write(stdout)
+        return process.returncode
+
+    def cleanup(self):
+        for process in self.processes:
+            process.terminate()
+
+    @staticmethod
+    def random_ip():
+        return "127.%d.%d.%d" % (random.randint(1, 254),
+                                 random.randint(1, 254),
+                                 random.randint(1, 254))
+
+    @staticmethod
+    def random_port():
+        return random.randint(10000, 0xFFFF - 10)
+
+    def run(self):
+        if self.launch(['poll-validate'] + self.xml_list) != 0:
+            return -1
+
+        core_path = os.path.join(self.directory, 'core')
+        if os.path.exists(core_path):
+            os.unlink(core_path)
+
+        self.background(['cb-server', '--insecure', '-p', "%d" % self.port,
+                         '-d', self.directory] + self.cb_list)
+        if self.pcap:
+            self.background(['/usr/sbin/tcpdump', '-i', 'lo', '-w', self.pcap,
+                             '-s', '0', 'port', '%d' % self.port, 'and',
+                             'host', self.ip_address])
+        replay_result = self.launch(['cb-replay', '--host', self.ip_address,
+                                    '--port', '%d' % self.port] +
+                                    self.xml_list)
+
+        # sleep as a synchronicity mechanism is prone to fail, but used for
+        # now, as the kernel generating 'core' may not happen immediately
+        if not os.path.exists(core_path):
+            time.sleep(1)
+
+        # if the flag "should_core" is provided, thats the only thing we care
+        # about checking
+        if self.should_core:
+            if os.path.exists(core_path):
+                logging.warning("process generated core: %s", core_path)
+                return 0
+            else:
+                logging.warning("core expected, but not exists: %s", core_path)
+                return -1
+
+        if os.path.exists(core_path):
+            logging.warning("process generated core: %s", core_path)
+            return -1
+
+        return replay_result
+
+
+def main():
+
+    parser = argparse.ArgumentParser(description='Send CGC Polls and POVs')
+
+    required = parser.add_argument_group(title='required')
+    required.add_argument('--cb', required=True, type=str, nargs='+',
+                          help='Challenge Binaries to run')
+    required.add_argument('--directory', required=True, type=str,
+                          help='Directory containing challenge binaries')
+
+    parser.add_argument('--log', required=False, type=str, help='Log filenam')
+    parser.add_argument('--pcap', required=False, type=str,
+                        help='PCAP output file')
+    parser.add_argument('--port', required=False, type=int,
+                        help='PORT to run the CB')
+    parser.add_argument('--should_core', required=False, action='store_true',
+                        default=False, help='This test should cause a core')
+
+    exgroup = parser.add_argument_group(title='XML files')
+    group = exgroup.add_mutually_exclusive_group(required=True)
+    group.add_argument('--xml', type=str, nargs='+', help='POV/POLL XML File to evaluate')
+    group.add_argument('--xml_dir', type=str, help='Directory containing POV/POLL XML Files to evaluate')
+
+    args = parser.parse_args()
+
+    xml_files = args.xml
+    if args.xml == None:
+        xml_files = glob.glob("%s/*.xml" % args.xml_dir)
+  
+    log_fh = sys.stdout
+    if args.log is not None:
+        log_fh = open(args.log, 'w')
+    
+    logging.basicConfig(format='# %(message)s', level=logging.DEBUG, stream=log_fh)
+
+    logging.debug("command line: %s", ' '.join(sys.argv))
+
+    ret = -1
+    runner = Runner(args.port, args.cb, xml_files, args.pcap, args.directory,
+                    args.should_core, log_fh)
+    try:
+        ret = runner.run()
+    except KeyboardInterrupt:
+        logging.warning('interrupted')
+    finally:
+        runner.cleanup()
+    return ret
+
+if __name__ == "__main__":
+    exit(main())
