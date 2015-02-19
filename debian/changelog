@@ -1,0 +1,11 @@
+cb-testing (3859-cqe) UNRELEASED; urgency=low
+
+  * build
+
+ -- Brian Caswell <bmc@lungetech.com>  Mon, 16 Feb 2015 21:25:39 +0000
+
+cb-testing (1.0) unstable; urgency=low
+
+  * Initial Release.
+
+ -- bmc <bmc@lungetech.com>  Thu, 17 Apr 2014 16:45:08 -0400
