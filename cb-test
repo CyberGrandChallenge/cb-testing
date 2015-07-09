@@ -1,0 +1,441 @@
+#!/usr/bin/python
+
+"""
+CB Testing tool
+
+Copyright (C) 2014 - Brian Caswell <bmc@lungetech.com>
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+This tool allows verification of POV and POLLs with a CGC challenge binary
+using 'cb-replay', 'tcpdump', and 'cb-server'.
+"""
+
+import argparse
+import time
+import Queue
+import platform
+import glob
+import logging
+import os
+import random
+import resource
+import signal
+import socket
+import subprocess
+import sys
+import thread
+import threading
+
+
+class TimeoutException(Exception):
+    pass
+
+
+class Timeout:
+    """ Timeout - A class to use within 'with' for timing out a block via
+    exceptions and alarm."""
+
+    def __init__(self, seconds):
+        self.seconds = seconds
+
+    def handle_timeout(self, signum, frame):
+        raise TimeoutException("timed out")
+
+    def __enter__(self):
+        if self.seconds:
+            signal.signal(signal.SIGALRM, self.handle_timeout)
+            signal.alarm(self.seconds)
+
+    def __exit__(self, exit_type, exit_value, traceback):
+        if self.seconds:
+            signal.alarm(0)
+
+
+class Background(object):
+    def __init__(self, cmd):
+        self.log = logging.getLogger('cb-test')
+        self.log.info('launching %s', ' '.join(cmd))
+        self.cmd = cmd[0]
+        self.process = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                        stderr=subprocess.PIPE)
+        self.threads = []
+        self.log_queue = Queue.Queue()
+        self.log_handle(self.process.stdout, False)
+        self.log_handle(self.process.stderr, True)
+
+    def log_handle(self, filehandle, should_repr):
+        def log_background(log, should_repr, queue):
+            try:
+                for line in iter(log.readline, ''):
+                    queue.put(line)
+                    if should_repr:
+                        self.log.warning('%s: %s', self.cmd, repr(line[:-1]))
+                    else:
+                        self.log.warning('%s: %s', self.cmd, line[:-1])
+                log.close()
+            except KeyboardInterrupt:
+                thread.interrupt_main()
+
+        my_thread = threading.Thread(target=log_background,
+                                     args=(filehandle, should_repr, self.log_queue))
+        my_thread.daemon = True
+        my_thread.start()
+        self.threads.append(my_thread)
+
+    def terminate(self):
+        self.log.debug('terminating %s', self.cmd)
+        try:
+            self.process.terminate()
+        except OSError:
+            pass
+        for my_thread in self.threads:
+            my_thread.join()
+
+    def wait(self):
+        self.log.debug('waiting for %s to terminate', self.cmd)
+        wval = self.process.wait()
+        result = []
+        while not self.log_queue.empty():
+            result.append(self.log_queue.get())
+            self.log_queue.task_done()
+
+        self.log.debug('process returned %s', repr(wval))
+        return wval
+
+
+class Runner(object):
+    pov_signals = [signal.SIGSEGV, signal.SIGILL, signal.SIGBUS]
+
+    def __init__(self, port, cb_list, xml_list, pcap, wrapper, directory,
+                 should_core, failure_ok, should_debug, timeout, log_fh):
+        self.log = logging.getLogger('cb-test')
+        self.port = port
+        self.cb_list = cb_list
+        self.xml_list = xml_list
+        self.pcap = pcap
+        self.wrapper = wrapper
+        self.directory = directory
+        self.should_core = should_core
+        self.should_debug = should_debug
+        self.failure_ok = failure_ok
+        self.timeout = timeout
+        self.processes = []
+        self.log_fh = log_fh
+
+        self.ip_address = self.random_ip()
+        if not isinstance(self.port, int) or self.port == 0:
+            self.port = self.random_port()
+
+        resource.setrlimit(resource.RLIMIT_CORE, (resource.RLIM_INFINITY,
+                                                  resource.RLIM_INFINITY))
+
+    def background(self, cmd):
+        process = Background(cmd)
+        self.processes.append(process)
+        if process.process.poll():
+            raise Exception('background process failed: %s' % (' '.join(cmd)))
+        return process
+
+    def launch(self, cmd, log_error=False):
+        self.log.info('launching %s', ' '.join(cmd))
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE)
+        stdout, stderr = process.communicate()
+        if len(stderr):
+            for line in stderr.split('\n'):
+                if log_error:
+                    self.log.error('%s (stderr): %s', cmd[0], repr(line))
+                else:
+                    self.log.warning('%s (stderr): %s', cmd[0], repr(line))
+        self.log_fh.write(stdout)
+        return process.returncode
+
+    def cleanup(self):
+        for process in self.processes:
+            process.terminate()
+
+    @staticmethod
+    def random_ip():
+        return "127.%d.%d.%d" % (random.randint(1, 254),
+                                 random.randint(1, 254),
+                                 random.randint(1, 254))
+
+    def verify_cb(self):
+        """ Verify each CB is valid before continuing """
+        for cb in self.cb_list:
+            cb_path = os.path.join(self.directory, cb)
+            try:
+                subprocess.check_output(['cgcef_verify', cb_path])
+            except Exception as err:
+                self.log.error('CB did not verify: %s', str(err))
+                return -1
+        return 0
+
+    @staticmethod
+    def random_port():
+        return random.randint(0x2000, 0x8000 - 1)
+
+    def log_packages(self):
+        if 'debian' in platform.dist()[0]:
+            import apt
+            cache = apt.Cache()
+            cgc_packages = []
+            for package_name in cache.keys():
+                if 'cgc' not in package_name:
+                    continue
+                package = cache[package_name]
+
+                status = '%s: (installed: %s)' % (package.name, repr(package.is_installed))
+                for version in package.versions:
+                    status += ' version: %s' % version.version
+
+                cgc_packages.append(status)
+
+            cgc_packages.sort()
+            for package in cgc_packages:
+                self.log.error('package: %s' % package)
+
+    @staticmethod
+    def signal_name(sig_id):
+        for name, value in signal.__dict__.iteritems():
+            if sig_id == value:
+                return name
+        return 'UNKNOWN'
+
+    def start_server(self, connection_count):
+        assert connection_count > 0
+        server_cmd = ['cb-server', '--insecure', '-p', "%d" % self.port, '-d',
+                      self.directory, '-m', "%d" % connection_count]
+
+        if self.timeout > 0:
+            server_cmd += ['-t', '%d' % self.timeout]
+
+        if self.should_debug:
+            server_cmd += ['--debug']
+        else:
+            server_cmd += ['-c', '0']
+
+        if self.wrapper:
+            server_cmd += ['-w', self.wrapper]
+
+        server_cmd += self.cb_list
+
+        return self.background(server_cmd)
+
+    def start_pcap(self):
+        if self.pcap:
+            pcap = self.background(['/usr/sbin/tcpdump', '-i', 'lo', '-w',
+                                    self.pcap, '-s', '0', '-B', '65536',
+                                    'port', '%d' % self.port, 'and',
+                                    'host', self.ip_address])
+            while not pcap.log_queue.qsize():
+                time.sleep(0.1)
+            return pcap
+        return None
+
+    def start_replay(self, xml):
+        replay_cmd = ['cb-replay', '--host', self.ip_address, '--port', '%d' %
+                      self.port] + xml
+
+        if self.timeout > 0:
+            replay_cmd += ['--timeout', '%d' % self.timeout]
+
+        if self.failure_ok:
+            replay_cmd += ['--failure_ok']
+
+        if self.should_debug:
+            replay_cmd += ['--debug']
+
+        return self.launch(replay_cmd)
+
+    def verify_poll(self):
+        # until a 'safe' DTD validation tool is available, we will just rely on
+        # cb-replay to do this.
+        return 0
+#        return self.launch(['poll-validate'] + self.xml_list, log_error=True)
+
+    def use_server_connections(self, count):
+        # the replay tool fails, the server might run forever waiting to
+        # process input. Give it the connections it's expecting and hope
+        # it exits normally.
+        for _ in range(0, count):
+            try:
+                sock = socket.create_connection((self.ip_address,
+                                                 self.port))
+            except socket.error:
+                continue
+            sock.close()
+
+    def check_result(self, replay_result, sig):
+        cored = False
+
+        if sig is None:
+            self.log.error('termination of cb-server timed out')
+            return -1
+
+        if sig < 0:
+            sig = -sig
+            if sig in Runner.pov_signals:
+                cored = True
+            elif sig == signal.SIGALRM:
+                self.log.error('process timed out (signal %d: %s)', sig,
+                               self.signal_name(sig))
+                if self.failure_ok:
+                    return 0
+                return -1
+            else:
+                self.log.error('process errored (signal %d: %s)', sig,
+                               self.signal_name(sig))
+                return -1
+
+        if cored is True:
+            self.log.error('core identified')
+            if self.should_core:
+                self.log.debug('process cored as expected (signal %d: %s)',
+                               sig, self.signal_name(sig))
+                return 0
+            else:
+                self.log.error('process cored.  (signal %d: %s)', sig,
+                               self.signal_name(sig))
+                return -1
+        else:
+            if self.should_core:
+                self.log.error('core expected, no cores identified')
+                return -1
+
+        return replay_result
+
+    def run(self):
+        self.log_packages()
+
+        if self.verify_cb() != 0:
+            return -1
+
+        if self.verify_poll() != 0:
+            return -1
+
+        xml_sets = [self.xml_list]
+        if self.should_core or True:
+            xml_sets = []
+            for xml in self.xml_list:
+                xml_sets.append([xml])
+
+        pcap = self.start_pcap()
+        for xml_list in xml_sets:
+            server = self.start_server(len(xml_list))
+            replay_result = self.start_replay(xml_list)
+            # if replay_result != 0:
+
+            if server.process.poll() is None:
+                self.use_server_connections(len(xml_list))
+
+            sig = None
+
+            # wait a maximum of 30 seconds after our replay and socket cleanup
+            # finishes before terminating cb-server if it hasn't returned yet.
+            try:
+                with Timeout(30):
+                    sig = server.wait()
+            except TimeoutException:
+                server.terminate()
+
+            result = self.check_result(replay_result, sig)
+            if result != 0:
+                if pcap is not None:
+                    pcap.terminate()
+                return result
+
+        if pcap is not None:
+            pcap.terminate()
+
+        return 0
+
+
+def main():
+
+    parser = argparse.ArgumentParser(description='Send CGC Polls and POVs')
+
+    required = parser.add_argument_group(title='required')
+    required.add_argument('--cb', required=True, type=str, nargs='+',
+                          help='Challenge Binaries to run')
+    required.add_argument('--directory', required=True, type=str,
+                          help='Directory containing challenge binaries')
+
+    parser.add_argument('--debug', required=False, action='store_true',
+                        default=False, help='Enable debugging')
+    parser.add_argument('--log', required=False, type=str, help='Log filename')
+    parser.add_argument('--pcap', required=False, type=str,
+                        help='PCAP output file')
+    parser.add_argument('--port', required=False, type=int,
+                        help='PORT to run the CB')
+    parser.add_argument('--timeout', required=False, type=int,
+                        help='Maximum duration for each Poll or POV')
+    parser.add_argument('--should_core', required=False, action='store_true',
+                        default=False, help='This test should cause a core')
+    parser.add_argument('--wrapper', required=False, type=str,
+                        help='Executable to wrap each CB for instrumentation')
+    parser.add_argument('--failure_ok', required=False, action='store_true',
+                        default=False, help='Failures for this test are '
+                        'accepted')
+
+    exgroup = parser.add_argument_group(title='XML files')
+    group = exgroup.add_mutually_exclusive_group(required=True)
+    group.add_argument('--xml', type=str, nargs='+', help='POV/POLL XML File '
+                       'to evaluate')
+    group.add_argument('--xml_dir', type=str, help='Directory containing '
+                       'POV/POLL XML Files to evaluate')
+
+    args = parser.parse_args()
+
+    xml_files = args.xml
+    if args.xml is None:
+        xml_files = glob.glob("%s/*.xml" % args.xml_dir)
+    xml_files.sort()
+
+    log_level = logging.ERROR
+    if args.debug:
+        log_level = logging.DEBUG
+
+    log_fh = sys.stdout
+    if args.log is not None:
+        log_fh = open(args.log, 'w')
+
+    logger = logging.getLogger('cb-test')
+    log_stream = logging.StreamHandler(log_fh)
+    log_stream.setLevel(log_level)
+    log_stream.setFormatter(logging.Formatter('# %(message)s'))
+    logger.addHandler(log_stream)
+
+    logger.debug("command line: %s", ' '.join(sys.argv))
+
+    ret = -1
+    runner = Runner(args.port, args.cb, xml_files, args.pcap, args.wrapper,
+                    args.directory, args.should_core, args.failure_ok,
+                    args.debug, args.timeout, log_fh)
+    try:
+        ret = runner.run()
+    except KeyboardInterrupt:
+        logger.warning('interrupted')
+    finally:
+        runner.cleanup()
+    return ret
+
+if __name__ == "__main__":
+    exit(main())
