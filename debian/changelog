@@ -1,0 +1,11 @@
+cb-testing (7667-cfe-rc2) UNRELEASED; urgency=low
+
+  * build
+
+ -- Brian Caswell <bmc@lungetech.com>  Tue, 29 Sep 2015 15:02:26 +0000
+
+cb-testing (1.0) unstable; urgency=low
+
+  * Initial Release.
+
+ -- bmc <bmc@lungetech.com>  Thu, 17 Apr 2014 16:45:08 -0400
