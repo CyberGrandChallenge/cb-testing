@@ -1,0 +1,11 @@
+cb-testing (10551-cfe-rc8) UNRELEASED; urgency=low
+
+  * build
+
+ -- Brian Caswell <bmc@lungetech.com>  Tue, 10 Jan 2017 21:21:57 +0000
+
+cb-testing (1.0) unstable; urgency=low
+
+  * Initial Release.
+
+ -- bmc <bmc@lungetech.com>  Thu, 17 Apr 2014 16:45:08 -0400

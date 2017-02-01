@@ -1,0 +1,17 @@
+Source: cb-testing
+Section: devel
+Priority: extra
+Maintainer: bmc <bmc@lungetech.com>
+Build-Depends: debhelper (>= 8.0.0)
+Standards-Version: 3.9.3
+Homepage: http://www.darpa.mil/cybergrandchallenge/
+
+Package: cb-testing
+Architecture: all
+Depends: ${python:Depends}, ${misc:Depends}, python, python-lxml, cgc-service-launcher, openssh-client, tcpdump, cgc-service-launcher, poll-generator
+Description: Challenge Binary Testing tools
+ Provide a simple framework for testing Cyber Grand Challenge binaries to verify
+ the polling, proof-of-vulnerabilities, and traffic captures work as expected.
+ .
+ These are exemplar tools and are intended to showcase the functionality of CB
+ testing.
